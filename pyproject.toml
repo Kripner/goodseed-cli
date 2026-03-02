@@ -4,14 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "goodseed"
-version = "0.2.6"
+version = "0.3.0"
 description = "ML experiment tracker"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 requires-python = ">=3.9"
 authors = [
-    { name = "Goodseed Team" }
+    { name = "Matěj Kripner" },
+    { name = "Vojtěch Hotmar" },
 ]
 keywords = ["machine-learning", "experiment-tracking", "mlops"]
 classifiers = [
@@ -26,7 +27,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = [
+    "psutil>=5.0.0",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -57,4 +60,10 @@ target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+markers = [
+    "integration: end-to-end integration tests",
+]
 

@@ -1,186 +1,129 @@
 #!/usr/bin/env python3
-"""Run multiple MLP experiments with different hyperparameters.
+"""Run MLP experiments with different hyperparameters.
 
-This script runs several experiments to generate test data for the frontend.
+Uses a synthetic 10-class classification problem (20k samples).
 """
-
-import itertools
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.datasets import load_iris
+from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 import goodseed
 
 
-class SimpleMLP(nn.Module):
-    """Simple multi-layer perceptron."""
-
-    def __init__(self, input_size: int, hidden_size: int, num_classes: int):
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes, dropout):
         super().__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, num_classes)
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_classes),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        x = self.relu(x)
-        x = self.fc3(x)
-        return x
+    def forward(self, x):
+        return self.net(x)
 
 
 def load_data():
-    """Load and preprocess the Iris dataset."""
-    iris = load_iris()
-    X, y = iris.data, iris.target
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+    X, y = make_classification(
+        n_samples=20000, n_features=40, n_informative=15, n_redundant=5,
+        n_classes=10, n_clusters_per_class=2, random_state=42,
     )
-
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
-
-    X_train = torch.FloatTensor(X_train)
-    X_test = torch.FloatTensor(X_test)
-    y_train = torch.LongTensor(y_train)
-    y_test = torch.LongTensor(y_test)
-
-    return X_train, X_test, y_train, y_test
-
-
-def train_one(hidden_size: int, learning_rate: float, batch_size: int):
-    """Train one experiment with given hyperparameters."""
-    input_size = 4
-    num_classes = 3
-    num_epochs = 100
-
-    run = goodseed.Run(
-        experiment_name="iris-mlp",
-        project="examples",
+    return (
+        torch.FloatTensor(X_train), torch.FloatTensor(X_test),
+        torch.LongTensor(y_train), torch.LongTensor(y_test),
     )
 
-    # Log configuration
+
+def train_one(hidden_size, lr, dropout, num_epochs):
+    run = goodseed.Run(experiment_name="synth-mlp", project="examples")
+
     run.log_configs({
-        "model/type": "MLP",
-        "model/input_size": input_size,
         "model/hidden_size": hidden_size,
-        "model/num_classes": num_classes,
-        "training/learning_rate": learning_rate,
-        "training/num_epochs": num_epochs,
-        "training/batch_size": batch_size,
-        "training/optimizer": "Adam",
-        "dataset/name": "iris",
+        "model/dropout": dropout,
+        "training/lr": lr,
+        "training/epochs": num_epochs,
+        "dataset": "make_classification-20k",
     })
 
-    # Load data
     X_train, X_test, y_train, y_test = load_data()
-
-    # Create model
-    model = SimpleMLP(input_size, hidden_size, num_classes)
+    model = MLP(40, hidden_size, 10, dropout)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # Training loop
+    batch_step = 0
     for epoch in range(num_epochs):
         model.train()
+        idx = torch.randperm(len(X_train))
+        total_loss, correct, total, n = 0.0, 0, 0, 0
 
-        indices = torch.randperm(len(X_train))
-        total_loss = 0.0
-        correct = 0
-        total = 0
-
-        for i in range(0, len(X_train), batch_size):
-            batch_indices = indices[i : i + batch_size]
-            X_batch = X_train[batch_indices]
-            y_batch = y_train[batch_indices]
-
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-
+        for i in range(0, len(X_train), 64):
+            bi = idx[i:i+64]
+            out = model(X_train[bi])
+            loss = criterion(out, y_train[bi])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total += y_batch.size(0)
-            correct += (predicted == y_batch).sum().item()
+            correct += (out.argmax(1) == y_train[bi]).sum().item()
+            total += len(bi)
+            n += 1
+            batch_step += 1
+            if batch_step % 10 == 0:
+                run.log_metrics({"train/batch_loss": loss.item()}, step=batch_step)
 
-        avg_loss = total_loss / (len(X_train) / batch_size)
-        train_accuracy = correct / total
+        train_loss = total_loss / n
+        train_acc = correct / total
+        run.log_metrics({"train/loss": train_loss, "train/accuracy": train_acc}, step=epoch + 1)
 
-        run.log_metrics(
-            {
-                "train/loss": avg_loss,
-                "train/accuracy": train_accuracy,
-            },
-            step=epoch + 1,
-        )
-
-        # Evaluate on test set every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 5 == 0:
             model.eval()
             with torch.no_grad():
-                test_outputs = model(X_test)
-                test_loss = criterion(test_outputs, y_test).item()
-                _, predicted = torch.max(test_outputs.data, 1)
-                test_accuracy = (predicted == y_test).sum().item() / len(y_test)
+                test_out = model(X_test)
+                test_loss = criterion(test_out, y_test).item()
+                test_acc = (test_out.argmax(1) == y_test).sum().item() / len(y_test)
+            run.log_metrics({"test/loss": test_loss, "test/accuracy": test_acc}, step=epoch + 1)
 
-            run.log_metrics(
-                {
-                    "test/loss": test_loss,
-                    "test/accuracy": test_accuracy,
-                },
-                step=epoch + 1,
-            )
+        if (epoch + 1) % 25 == 0:
+            print(f"    Epoch {epoch+1:3d}/{num_epochs}  loss={train_loss:.4f}  train_acc={train_acc:.4f}  test_acc={test_acc:.4f}")
 
-    # Final evaluation
-    model.eval()
-    with torch.no_grad():
-        test_outputs = model(X_test)
-        _, predicted = torch.max(test_outputs.data, 1)
-        final_accuracy = (predicted == y_test).sum().item() / len(y_test)
-
-    run.log_configs({
-        "summary/final_accuracy": final_accuracy,
-    })
-
+    run.log_configs({"summary/final_test_acc": test_acc})
+    print(f"  -> final test_acc={test_acc:.4f}")
     run.close()
-
-    print(f"  Run {run.run_name}: hidden={hidden_size}, lr={learning_rate}, batch={batch_size} -> acc={final_accuracy:.4f}")
-    return final_accuracy
+    return test_acc
 
 
 def main():
-    """Run experiments with different hyperparameter combinations."""
-    # Define hyperparameter grid
-    hidden_sizes = [8, 16, 32]
-    learning_rates = [0.001, 0.01, 0.05]
-    batch_sizes = [8, 16]
-
-    combinations = list(itertools.product(hidden_sizes, learning_rates, batch_sizes))
-    print(f"Running {len(combinations)} experiments...\n")
-
+    configs = [
+        (32,  0.001, 0.1, 200),
+        (64,  0.003, 0.1, 200),
+        (128, 0.003, 0.2, 200),
+        (128, 0.01,  0.2, 200),
+        (256, 0.003, 0.3, 200),
+    ]
+    print(f"Running {len(configs)} experiments...\n")
     results = []
-    for i, (hidden, lr, batch) in enumerate(combinations, 1):
-        print(f"[{i}/{len(combinations)}]")
-        acc = train_one(hidden, lr, batch)
-        results.append((hidden, lr, batch, acc))
+    for i, (h, lr, drop, ep) in enumerate(configs, 1):
+        print(f"[{i}/{len(configs)}] hidden={h}, lr={lr}, dropout={drop}")
+        acc = train_one(h, lr, drop, ep)
+        results.append((h, lr, drop, acc))
 
     print("\n--- Summary ---")
     results.sort(key=lambda x: x[3], reverse=True)
-    for hidden, lr, batch, acc in results[:5]:
-        print(f"  hidden={hidden}, lr={lr}, batch={batch} -> {acc:.4f}")
+    for h, lr, drop, acc in results:
+        print(f"  hidden={h}, lr={lr}, dropout={drop} -> {acc:.4f}")
 
 
 if __name__ == "__main__":
     main()
-

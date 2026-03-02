@@ -1,8 +1,11 @@
 """Utility functions for Goodseed."""
 
+from __future__ import annotations
+
+import json
 import random
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Union
 
 # Word lists for readable run IDs (adjective-animal format)
 ADJECTIVES = [
@@ -23,8 +26,8 @@ ANIMALS = [
 ]
 
 
-def generate_run_name() -> str:
-    """Generate a run name like 'bold-falcon'."""
+def generate_run_id() -> str:
+    """Generate a run ID like 'bold-falcon'."""
     adj = random.choice(ADJECTIVES)
     animal = random.choice(ANIMALS)
     return f"{adj}-{animal}"
@@ -46,7 +49,7 @@ def cast_to_string(value: Any) -> str:
     return str(value)
 
 
-def serialize_value(value: Any) -> Tuple[str, str]:
+def serialize_value(value: Any) -> tuple[str, str]:
     """Serialize a value for storage, returning (type_tag, serialized_string).
 
     All values are serialized as strings for SQLite TEXT columns.
@@ -63,6 +66,8 @@ def serialize_value(value: Any) -> Tuple[str, str]:
         return ("str", value)
     elif isinstance(value, datetime):
         return ("datetime", value.isoformat())
+    elif isinstance(value, (set, frozenset)):
+        return ("string_set", json.dumps(sorted(str(v) for v in value)))
     else:
         return ("str", str(value))
 
@@ -83,16 +88,18 @@ def deserialize_value(type_tag: str, raw_value: Any) -> Any:
         return str(raw_value)
     elif type_tag == "datetime":
         return datetime.fromisoformat(raw_value)
+    elif type_tag == "string_set":
+        return set(json.loads(raw_value))
     else:
         return raw_value
 
 
 def flatten_dict(
-    data: Dict[str, Any],
+    data: dict[str, Any],
     parent_key: str = "",
     sep: str = "/",
     cast_unsupported: bool = False,
-) -> Dict[str, SupportedValue]:
+) -> dict[str, SupportedValue]:
     """Flatten a nested dictionary into path-based keys.
 
     Args:
@@ -107,7 +114,7 @@ def flatten_dict(
     Raises:
         TypeError: If a value is unsupported and cast_unsupported is False.
     """
-    items: List[Tuple[str, SupportedValue]] = []
+    items: list[tuple[str, SupportedValue]] = []
 
     for key, value in data.items():
         new_key = f"{parent_key}{sep}{key}" if parent_key else key

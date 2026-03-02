@@ -4,15 +4,18 @@ Usage:
     goodseed [dir]               - Start the local server (alias for 'goodseed serve')
     goodseed serve [dir]         - Start the local server
     goodseed list [dir]          - List projects (or runs with --project)
+    goodseed upload -p <project> [--run-id RUN_ID]  - Upload unuploaded run data
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Optional
 
-from goodseed.config import get_projects_dir
+from goodseed.config import get_api_key, get_projects_dir, get_run_db_path
 from goodseed.server import _scan_projects, _scan_runs, run_server
+from goodseed.sync import upload_run
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -42,12 +45,12 @@ def cmd_list(args: argparse.Namespace) -> int:
         for run in runs:
             status = run.get("status", "unknown")
             run_id = run.get("run_id", "?")
-            experiment_name = run.get("experiment_name")
+            run_name = run.get("experiment_name")
             created_at = run.get("created_at") or "-"
 
             print(f"  [{status}] {run_id}")
-            if experiment_name:
-                print(f"      name: {experiment_name}")
+            if run_name:
+                print(f"      name: {run_name}")
             print(f"      created: {created_at[:19] if len(created_at) > 19 else created_at}")
 
         print(f"\n{len(runs)} run(s) in {args.project}")
@@ -68,6 +71,40 @@ def cmd_list(args: argparse.Namespace) -> int:
 
         print(f"\n{len(projects)} project(s)")
 
+    return 0
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    """Upload unuploaded data from a run's local database."""
+    project = args.project
+    api_key = args.api_key or get_api_key()
+    if not api_key:
+        print("Error: No API key. Set GOODSEED_API_KEY or pass --api-key.")
+        return 1
+
+    db_paths: list[Path]
+    if args.run_id:
+        db_path = get_run_db_path(project, args.run_id)
+        if not db_path.exists():
+            print(f"Error: Database not found at {db_path}")
+            return 1
+        db_paths = [db_path]
+    else:
+        runs_dir = get_projects_dir() / project / "runs"
+        db_paths = sorted(runs_dir.glob("*.sqlite"))
+        if not db_paths:
+            print(f"No runs found in project '{project}'.")
+            return 0
+
+    total = 0
+    for db_path in db_paths:
+        print(f"Uploading run '{db_path.stem}' from {db_path} ...")
+        try:
+            total += upload_run(db_path, api_key)
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            return 1
+    print(f"Done. Uploaded {total} item(s).")
     return 0
 
 
@@ -105,10 +142,27 @@ def create_parser() -> argparse.ArgumentParser:
         help="List runs within a specific project (e.g. workspace/project-name)",
     )
 
+    # upload command
+    upload_parser = subparsers.add_parser(
+        "upload", help="Upload unuploaded data from a local run",
+    )
+    upload_parser.add_argument(
+        "-r", "--run-id",
+        help="The run ID to upload (omit to upload all runs in project)",
+    )
+    upload_parser.add_argument(
+        "-p", "--project", required=True,
+        help="Project name (workspace/project)",
+    )
+    upload_parser.add_argument(
+        "--api-key",
+        help="API key (default: GOODSEED_API_KEY env var)",
+    )
+
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     parser = create_parser()
     args = parser.parse_args(argv)
@@ -124,6 +178,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_serve(args)
     elif args.command == "list":
         return cmd_list(args)
+    elif args.command == "upload":
+        return cmd_upload(args)
     else:
         parser.print_help()
         return 1

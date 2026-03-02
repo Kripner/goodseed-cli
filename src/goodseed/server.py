@@ -1,26 +1,35 @@
 """Local HTTP server for serving experiment data to the frontend.
 
 Reads SQLite run files from the projects directory and exposes a JSON API.
-The frontend (served from goodseed.ai or localhost) connects to this server.
+The frontend (served from goodseed.ai or 127.0.0.1) connects to this server.
 
 Usage:
     goodseed serve [dir] [--port PORT]
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import math
 import re
-import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-logger = logging.getLogger("goodseed.server")
+from goodseed.storage import (
+    downsample_metrics,
+    read_configs,
+    read_metrics,
+    read_metric_paths,
+    read_run_summary,
+    read_string_series,
+    write_run_meta,
+)
 
-from goodseed.utils import deserialize_value
+logger = logging.getLogger("goodseed.server")
 
 
 def _sanitize_for_json(obj: object) -> object:
@@ -43,22 +52,7 @@ def _sanitize_for_json(obj: object) -> object:
     return obj
 
 
-def _open_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open a SQLite database in read-only mode."""
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-    conn.execute("PRAGMA busy_timeout=3000")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _read_meta(conn: sqlite3.Connection) -> Dict[str, str]:
-    """Read all run_meta key-value pairs."""
-    rows = conn.execute("SELECT key, value FROM run_meta").fetchall()
-    return {row["key"]: row["value"] for row in rows}
-
-
-def _scan_runs(projects_dir: Path) -> List[Dict[str, Any]]:
+def _scan_runs(projects_dir: Path) -> list[dict[str, Any]]:
     """Scan the projects directory for run SQLite files.
 
     Supports nested project names (e.g. ``workspace/project``) by recursively
@@ -71,30 +65,18 @@ def _scan_runs(projects_dir: Path) -> List[Dict[str, Any]]:
     for db_path in sorted(projects_dir.glob("**/runs/*.sqlite")):
         project_name = str(db_path.parent.parent.relative_to(projects_dir))
         try:
-            conn = _open_readonly(db_path)
-            try:
-                meta = _read_meta(conn)
-                try:
-                    ss_rows = conn.execute(
-                        """SELECT DISTINCT s.path FROM string_series s
-                           JOIN string_points p ON s.id = p.series_id
-                           ORDER BY s.path"""
-                    ).fetchall()
-                    string_series_paths = [row["path"] for row in ss_rows]
-                except sqlite3.OperationalError as e:
-                    logger.debug("string_series table not found in %s: %s", db_path, e)
-                    string_series_paths = []
-            finally:
-                conn.close()
+            meta, string_series_paths, metric_paths = read_run_summary(db_path)
 
             runs.append({
                 "project": project_name,
-                "run_id": meta.get("run_name", db_path.stem),
-                "experiment_name": meta.get("experiment_name"),
+                "run_id": meta.get("run_id", meta.get("run_name", db_path.stem)),
+                "experiment_name": meta.get("name", meta.get("experiment_name")),
                 "created_at": meta.get("created_at"),
                 "closed_at": meta.get("closed_at"),
                 "status": meta.get("status", "unknown"),
+                "trashed": meta.get("trashed") == "true",
                 "string_series_paths": string_series_paths,
+                "metric_paths": metric_paths,
             })
         except Exception:
             logger.warning("Failed to read run database: %s", db_path, exc_info=True)
@@ -104,151 +86,12 @@ def _scan_runs(projects_dir: Path) -> List[Dict[str, Any]]:
     return runs
 
 
-def _get_configs(db_path: Path) -> Dict[str, Any]:
-    """Read configs from a run database and deserialize values."""
-    conn = _open_readonly(db_path)
-    try:
-        rows = conn.execute("SELECT path, type_tag, value FROM configs").fetchall()
-    finally:
-        conn.close()
-
-    configs = {}
-    for row in rows:
-        configs[row["path"]] = deserialize_value(row["type_tag"], row["value"])
-    return configs
-
-
-def _ts_to_iso(ts: int) -> str:
-    """Convert a unix timestamp to ISO 8601 string."""
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _get_metrics(db_path: Path, metric_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Read metric points from a run database."""
-    conn = _open_readonly(db_path)
-    try:
-        if metric_path:
-            rows = conn.execute(
-                """SELECT s.path, p.step, p.y, p.ts
-                   FROM metric_points p
-                   JOIN metric_series s ON p.series_id = s.id
-                   WHERE s.path = ?
-                   ORDER BY p.step""",
-                (metric_path,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT s.path, p.step, p.y, p.ts
-                   FROM metric_points p
-                   JOIN metric_series s ON p.series_id = s.id
-                   ORDER BY s.path, p.step"""
-            ).fetchall()
-    finally:
-        conn.close()
-
-    return [
-        {
-            "path": row["path"],
-            "step": row["step"],
-            "value": row["y"],
-            "is_preview": False,
-            "preview_completion": None,
-            "logged_at": _ts_to_iso(row["ts"]),
-        }
-        for row in rows
-    ]
-
-
-def _get_metric_paths(db_path: Path) -> List[str]:
-    """Read distinct metric paths from a run database."""
-    conn = _open_readonly(db_path)
-    try:
-        rows = conn.execute(
-            """SELECT DISTINCT s.path FROM metric_series s
-               JOIN metric_points p ON s.id = p.series_id
-               ORDER BY s.path"""
-        ).fetchall()
-    finally:
-        conn.close()
-    return [row["path"] for row in rows]
-
-
-def _get_string_series(
-    db_path: Path,
-    series_path: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
-    tail: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Read string series points from a run database.
-
-    Returns {"points": [...], "total": <int>} where total is the full count
-    before limit/offset are applied.
-
-    If ``tail`` is given, returns the last ``tail`` rows (overrides limit/offset).
-    """
-    conn = _open_readonly(db_path)
-    try:
-        where = "WHERE s.path = ?" if series_path else ""
-        base_params: list = [series_path] if series_path else []
-
-        total_row = conn.execute(
-            f"""SELECT COUNT(*) as cnt
-                FROM string_points p
-                JOIN string_series s ON p.series_id = s.id
-                {where}""",
-            base_params,
-        ).fetchone()
-        total = total_row["cnt"] if total_row else 0
-
-        order_col = "p.step" if series_path else "s.path, p.step"
-
-        if tail is not None:
-            # Fetch last N rows: use a subquery with DESC, then re-order ASC
-            query = f"""SELECT * FROM (
-                SELECT s.path, p.step, p.value, p.ts
-                FROM string_points p
-                JOIN string_series s ON p.series_id = s.id
-                {where}
-                ORDER BY {order_col} DESC
-                LIMIT ?
-            ) sub ORDER BY {"step" if series_path else "path, step"}"""
-            rows = conn.execute(query, base_params + [tail]).fetchall()
-        else:
-            query = f"""SELECT s.path, p.step, p.value, p.ts
-                        FROM string_points p
-                        JOIN string_series s ON p.series_id = s.id
-                        {where}
-                        ORDER BY {order_col}"""
-            params = list(base_params)
-            if limit is not None:
-                query += " LIMIT ? OFFSET ?"
-                params.extend([limit, offset])
-            rows = conn.execute(query, params).fetchall()
-    except sqlite3.OperationalError as e:
-        logger.debug("string_series table not available in %s: %s", db_path, e)
-        return {"points": [], "total": 0}
-    finally:
-        conn.close()
-
-    points = [
-        {
-            "path": row["path"],
-            "step": row["step"],
-            "value": row["value"],
-            "logged_at": _ts_to_iso(row["ts"]),
-        }
-        for row in rows
-    ]
-    return {"points": points, "total": total}
-
-
-def _scan_projects(projects_dir: Path) -> List[Dict[str, Any]]:
+def _scan_projects(projects_dir: Path) -> list[dict[str, Any]]:
     """Scan the projects directory and return project metadata.
 
     Lightweight: uses file mtime instead of opening SQLite databases.
     """
-    projects: Dict[str, Dict[str, Any]] = {}
+    projects: dict[str, dict[str, Any]] = {}
     if not projects_dir.exists():
         return []
 
@@ -266,7 +109,7 @@ def _scan_projects(projects_dir: Path) -> List[Dict[str, Any]]:
     return result
 
 
-def _resolve_run_db(projects_dir: Path, project: str, run_name: str) -> Optional[Path]:
+def _resolve_run_db(projects_dir: Path, project: str, run_name: str) -> Path | None:
     """Resolve a run database file path, return None if not found."""
     db_path = projects_dir / project / "runs" / f"{run_name}.sqlite"
     if db_path.exists():
@@ -281,6 +124,8 @@ _ROUTE_CONFIGS = re.compile(r"^/api/runs/(.+)/([^/]+)/configs$")
 _ROUTE_METRICS = re.compile(r"^/api/runs/(.+)/([^/]+)/metrics$")
 _ROUTE_METRIC_PATHS = re.compile(r"^/api/runs/(.+)/([^/]+)/metric-paths$")
 _ROUTE_STRING_SERIES = re.compile(r"^/api/runs/(.+)/([^/]+)/string_series$")
+_ROUTE_TRASH_RESTORE = re.compile(r"^/api/runs/(.+)/([^/]+)/trash/restore$")
+_ROUTE_TRASH = re.compile(r"^/api/runs/(.+)/([^/]+)/trash$")
 
 
 class _RequestHandler(BaseHTTPRequestHandler):
@@ -327,7 +172,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 if not db_path:
                     self._send_error(404, f"Run not found: {project}/{run_name}")
                     return
-                configs = _get_configs(db_path)
+                configs = read_configs(db_path)
                 self._send_json({"configs": configs})
                 return
 
@@ -340,8 +185,34 @@ class _RequestHandler(BaseHTTPRequestHandler):
                     self._send_error(404, f"Run not found: {project}/{run_name}")
                     return
                 metric_path = query.get("path", [None])[0]
-                metrics = _get_metrics(db_path, metric_path)
-                self._send_json({"metrics": metrics})
+                point_count_str = query.get("pointCount", [None])[0]
+
+                if point_count_str:
+                    if not metric_path:
+                        self._send_error(400, "pointCount requires a path parameter")
+                        return
+                    try:
+                        point_count = int(point_count_str)
+                    except ValueError:
+                        self._send_error(400, "pointCount must be an integer")
+                        return
+                    first_idx_str = query.get("firstPointIndex", [None])[0]
+                    last_idx_str = query.get("lastPointIndex", [None])[0]
+                    try:
+                        first_idx = int(first_idx_str) if first_idx_str else None
+                        last_idx = int(last_idx_str) if last_idx_str else None
+                    except ValueError:
+                        self._send_error(400, "firstPointIndex and lastPointIndex must be integers")
+                        return
+                    result = downsample_metrics(
+                        db_path, metric_path, point_count,
+                        first_point_index=first_idx,
+                        last_point_index=last_idx,
+                    )
+                    self._send_json(result)
+                else:
+                    metrics = read_metrics(db_path, metric_path)
+                    self._send_json({"metrics": metrics})
                 return
 
             # GET /api/runs/<project>/<run_name>/metric-paths
@@ -352,7 +223,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 if not db_path:
                     self._send_error(404, f"Run not found: {project}/{run_name}")
                     return
-                paths = _get_metric_paths(db_path)
+                paths = read_metric_paths(db_path)
                 self._send_json({"paths": paths})
                 return
 
@@ -368,14 +239,52 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 limit_str = query.get("limit", [None])[0]
                 offset_str = query.get("offset", ["0"])[0]
                 tail_str = query.get("tail", [None])[0]
-                limit = int(limit_str) if limit_str else None
-                offset = int(offset_str) if offset_str else 0
-                tail = int(tail_str) if tail_str else None
-                result = _get_string_series(db_path, series_path, limit=limit, offset=offset, tail=tail)
+                try:
+                    limit = int(limit_str) if limit_str else None
+                    offset = int(offset_str) if offset_str else 0
+                    tail = int(tail_str) if tail_str else None
+                except ValueError:
+                    self._send_error(400, "limit, offset, and tail must be integers")
+                    return
+                result = read_string_series(db_path, series_path, limit=limit, offset=offset, tail=tail)
                 self._send_json({
                     "string_series": result["points"],
                     "total": result["total"],
                 })
+                return
+
+            self._send_error(404, "Not found")
+
+        except Exception as e:
+            self._send_error(500, str(e))
+
+    def do_POST(self) -> None:
+        """Route POST requests."""
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+
+        try:
+            # Match /restore before /trash (longer prefix first)
+            m = _ROUTE_TRASH_RESTORE.match(path)
+            if m:
+                project, run_name = m.group(1), m.group(2)
+                db_path = _resolve_run_db(self.projects_dir, project, run_name)
+                if not db_path:
+                    self._send_error(404, f"Run not found: {project}/{run_name}")
+                    return
+                write_run_meta(db_path, "trashed", None)
+                self._send_json({"ok": True})
+                return
+
+            m = _ROUTE_TRASH.match(path)
+            if m:
+                project, run_name = m.group(1), m.group(2)
+                db_path = _resolve_run_db(self.projects_dir, project, run_name)
+                if not db_path:
+                    self._send_error(404, f"Run not found: {project}/{run_name}")
+                    return
+                write_run_meta(db_path, "trashed", "true")
+                self._send_json({"ok": True})
                 return
 
             self._send_error(404, "Not found")
@@ -406,7 +315,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self) -> None:
         """Add CORS headers to the response."""
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -427,7 +336,7 @@ def run_server(projects_dir: Path, port: int = 8765, verbose: bool = False) -> N
     server = ThreadingHTTPServer(("127.0.0.1", port), _RequestHandler)
 
     if verbose:
-        print(f"Goodseed server running at http://localhost:{port}")
+        print(f"Goodseed server running at http://127.0.0.1:{port}")
         print(f"Data directory: {projects_dir}")
     print(f"View your runs at https://goodseed.ai/app/local?port={port}")
 

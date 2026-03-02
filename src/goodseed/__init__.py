@@ -2,13 +2,29 @@
 
 Example:
     >>> import goodseed
-    >>> run = goodseed.Run(experiment_name="my-experiment")
-    >>> run.log_configs({"learning_rate": 0.001})
-    >>> run.log_metrics({"loss": 0.5}, step=1)
+    >>> run = goodseed.Run(name="My Experiment", tags=["bert"])
+    >>> run["learning_rate"] = 0.001
+    >>> run["train/loss"].log(0.5, step=1)
     >>> run.close()
 """
 
-from goodseed.run import Run
+from goodseed.run import GitRef, Run, Storage
+from goodseed.projects import (
+    ensure_project,
+    list_projects,
+    list_runs,
+    list_workspaces,
+    me,
+)
 
-__version__ = "0.2.5"
-__all__ = ["Run"]
+__version__ = "0.3.0"
+__all__ = [
+    "Run",
+    "GitRef",
+    "Storage",
+    "list_workspaces",
+    "list_projects",
+    "ensure_project",
+    "list_runs",
+    "me",
+]

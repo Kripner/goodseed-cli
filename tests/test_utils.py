@@ -7,20 +7,20 @@ import pytest
 from goodseed.utils import (
     deserialize_value,
     flatten_dict,
-    generate_run_name,
+    generate_run_id,
     normalize_path,
     serialize_value,
 )
 
 
-class TestGenerateRunName:
+class TestGenerateRunId:
     def test_format(self):
-        name = generate_run_name()
+        name = generate_run_id()
         parts = name.split("-")
         assert len(parts) == 2
 
     def test_unique(self):
-        names = {generate_run_name() for _ in range(50)}
+        names = {generate_run_id() for _ in range(50)}
         # With 36 adjectives * 42 animals = 1512 combos,
         # 50 draws should almost never collide, but allow a few.
         assert len(names) >= 40

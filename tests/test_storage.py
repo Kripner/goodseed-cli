@@ -173,3 +173,88 @@ class TestLifecycle:
         assert not db_path.exists()
         assert not Path(str(db_path) + "-wal").exists()
         assert not Path(str(db_path) + "-shm").exists()
+
+
+class TestStringSeriesPoints:
+    def test_log_and_get_string_points(self, storage):
+        points = [
+            ("stdout", 0, "hello", 1735689600),
+            ("stdout", 1, "world", 1735689601),
+        ]
+        storage.log_string_points(points)
+        result = storage.get_string_points("stdout")
+        assert len(result) == 2
+        assert result[0]["value"] == "hello"
+        assert result[1]["value"] == "world"
+
+    def test_get_string_points_by_path(self, storage):
+        points = [
+            ("stdout", 0, "out", 1735689600),
+            ("stderr", 0, "err", 1735689600),
+        ]
+        storage.log_string_points(points)
+        assert len(storage.get_string_points("stdout")) == 1
+        assert len(storage.get_string_points("stderr")) == 1
+
+    def test_get_all_string_points(self, storage):
+        points = [
+            ("stdout", 0, "out", 1735689600),
+            ("stderr", 0, "err", 1735689600),
+        ]
+        storage.log_string_points(points)
+        all_points = storage.get_string_points()
+        assert len(all_points) == 2
+
+    def test_get_string_series_paths(self, storage):
+        points = [
+            ("stdout", 0, "a", 1735689600),
+            ("stderr", 0, "b", 1735689600),
+            ("stdout", 1, "c", 1735689601),
+        ]
+        storage.log_string_points(points)
+        paths = storage.get_string_series_paths()
+        assert paths == ["stderr", "stdout"]
+
+    def test_string_points_ordered_by_step(self, storage):
+        points = [
+            ("log", 3, "c", 1735689602),
+            ("log", 1, "a", 1735689600),
+            ("log", 2, "b", 1735689601),
+        ]
+        storage.log_string_points(points)
+        result = storage.get_string_points("log")
+        steps = [p["step"] for p in result]
+        assert steps == [1, 2, 3]
+
+    def test_get_last_string_step(self, storage):
+        points = [
+            ("log", 0, "a", 1735689600),
+            ("log", 5, "b", 1735689601),
+            ("log", 3, "c", 1735689602),
+        ]
+        storage.log_string_points(points)
+        assert storage.get_last_string_step("log") == 5
+
+    def test_get_last_string_step_missing(self, storage):
+        assert storage.get_last_string_step("nonexistent") is None
+
+
+class TestGetAllMaxSteps:
+    def test_mixed_series(self, storage):
+        storage.log_metric_points([
+            ("loss", 0, 0.9, 1735689600),
+            ("loss", 5, 0.5, 1735689601),
+            ("acc", 3, 0.7, 1735689602),
+        ])
+        storage.log_string_points([
+            ("log", 0, "a", 1735689600),
+            ("log", 10, "b", 1735689601),
+        ])
+        result = storage.get_all_max_steps()
+        assert result["loss"] == 5
+        assert result["acc"] == 3
+        assert result["log"] == 10
+
+    def test_empty(self, storage):
+        result = storage.get_all_max_steps()
+        assert result == {}

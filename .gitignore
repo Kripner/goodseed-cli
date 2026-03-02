@@ -31,6 +31,12 @@ Thumbs.db
 # Goodseed local data
 .goodseed/
 
+# Worktrees
+.worktrees/
+
+# age private keys
+keys.txt
+
 # Misc
 *.log
 .env
