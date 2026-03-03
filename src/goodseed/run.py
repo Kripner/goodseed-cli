@@ -359,6 +359,7 @@ class Run:
         goodseed_home: str | Path | None = None,
         log_dir: str | Path | None = None,
         created_at: str | None = None,
+        modified_at: str | None = None,
         capture_hardware_metrics: bool = True,
         capture_stdout: bool = True,
         capture_stderr: bool = True,
@@ -444,7 +445,7 @@ class Run:
             self._init_resume(resume_run_id, goodseed_home, log_dir)
         else:
             self._init_new_run(
-                run_id, goodseed_home, log_dir, created_at,
+                run_id, goodseed_home, log_dir, created_at, modified_at,
                 name, description, tags, git_ref,
             )
 
@@ -566,6 +567,7 @@ class Run:
         goodseed_home: str | Path | None,
         log_dir: str | Path | None,
         created_at: str | None,
+        modified_at: str | None,
         name: str | None,
         description: str | None,
         tags: list[str] | None,
@@ -590,6 +592,8 @@ class Run:
         self._storage.set_meta(
             "created_at", created_at or datetime.now(timezone.utc).isoformat()
         )
+        if modified_at:
+            self._storage.set_meta("modified_at", modified_at)
         self._storage.set_meta("status", "running")
         if self.name:
             self._storage.set_meta("name", self.name)

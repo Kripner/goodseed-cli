@@ -10,6 +10,7 @@ mechanism between the main process and the sync process.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import multiprocessing
@@ -46,8 +47,12 @@ def _api_post(
     body: dict[str, Any] | None = None,
     raw_body: bytes | None = None,
     content_type: str = "application/json",
+    compress: bool = False,
 ) -> tuple[int, bytes]:
     """POST to the API. Returns (status_code, response_bytes).
+
+    When *compress* is True the body is gzip-compressed and a
+    ``Content-Encoding: gzip`` header is added.
 
     Status 0 means network/connection error. Never raises.
     """
@@ -58,9 +63,14 @@ def _api_post(
     else:
         data = b""
 
+    if compress:
+        data = gzip.compress(data, compresslevel=6)
+
     req = Request(url, data=data, method="POST")
     req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Content-Type", content_type)
+    if compress:
+        req.add_header("Content-Encoding", "gzip")
 
     try:
         with urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
@@ -204,7 +214,7 @@ def _iter_sized_batches(
     overhead: int = 0,
     sep: int = 2,
     max_count: int = 0,
-    max_bytes: int = _MAX_BODY_BYTES,
+    max_bytes: int | None = None,
 ) -> Iterator[list[T]]:
     """Yield sub-lists of *items* fitting within *max_bytes* and *max_count*.
 
@@ -212,7 +222,10 @@ def _iter_sized_batches(
     the byte contribution of one item.  *overhead* is the fixed wrapper cost
     (e.g. the JSON envelope).  *sep* is the byte length of the delimiter
     between consecutive items (2 bytes for the JSON ``", "``, 0 for protobuf).
+    *max_bytes* defaults to ``_MAX_BODY_BYTES`` when *None*.
     """
+    if max_bytes is None:
+        max_bytes = _MAX_BODY_BYTES
     batch: list[T] = []
     size = overhead
     for item in items:
@@ -261,21 +274,28 @@ def _ensure_run_once(
     run_id: str,
     experiment_name: str | None,
     *,
+    created_at: str | None = None,
+    modified_at: str | None = None,
     log_errors: bool = True,
 ) -> tuple[str | None, str | None, bool]:
     """Ensure the run exists once.
 
     Returns (remote_id, error_message, retryable).
     """
+    body: dict[str, Any] = {
+        "workspace": workspace,
+        "project": project_name,
+        "run_id": run_id,
+        "experiment_name": experiment_name,
+    }
+    if created_at:
+        body["created_at"] = created_at
+    if modified_at:
+        body["modified_at"] = modified_at
     status, resp = _api_post(
         f"{API_BASE}/api/v1/runs",
         api_key=api_key,
-        body={
-            "workspace": workspace,
-            "project": project_name,
-            "run_id": run_id,
-            "experiment_name": experiment_name,
-        },
+        body=body,
     )
 
     if status == 200 and resp:
@@ -320,6 +340,9 @@ def _ensure_run_once(
 def _ensure_run(
     api_key: str, workspace: str, project_name: str,
     run_id: str, experiment_name: str | None,
+    *,
+    created_at: str | None = None,
+    modified_at: str | None = None,
 ) -> str | None:
     """Ensure the run exists on the remote. Returns remote UUID or None."""
     remote_id, _, _ = _ensure_run_once(
@@ -328,6 +351,8 @@ def _ensure_run(
         project_name,
         run_id,
         experiment_name,
+        created_at=created_at,
+        modified_at=modified_at,
         log_errors=True,
     )
     return remote_id
@@ -360,6 +385,7 @@ def _sync_configs(
             api_key=api_key,
             raw_body=body,
             content_type="application/json",
+            compress=True,
         )
         if status == 204:
             storage.mark_configs_uploaded([
@@ -440,6 +466,7 @@ def _sync_ingest_points(
             api_key=api_key,
             raw_body=body,
             content_type=ct,
+            compress=True,
         )
         if status == 200:
             mark_uploaded([upload_key(orig) for orig, _ in batch])
@@ -651,6 +678,8 @@ def upload_run(db_path: Path, api_key: str) -> int:
         project = storage.get_meta("project")
         run_id = storage.get_meta("run_id")
         name = storage.get_meta("name")
+        created_at = storage.get_meta("created_at")
+        modified_at = storage.get_meta("modified_at")
 
         if not project or not run_id:
             raise RuntimeError(
@@ -673,6 +702,8 @@ def upload_run(db_path: Path, api_key: str) -> int:
                 project_name,
                 run_id,
                 name,
+                created_at=created_at,
+                modified_at=modified_at,
                 log_errors=False,
             )
             if remote_id is not None:

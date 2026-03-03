@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "goodseed"
-version = "0.3.0"
+version = "0.3.1"
 description = "ML experiment tracker"
 readme = "README.md"
 license = "MIT"
