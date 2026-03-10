@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from goodseed.config import APP_URL
 from goodseed.storage import (
     downsample_metrics,
     read_configs,
@@ -338,7 +339,8 @@ def run_server(projects_dir: Path, port: int = 8765, verbose: bool = False) -> N
     if verbose:
         print(f"Goodseed server running at http://127.0.0.1:{port}")
         print(f"Data directory: {projects_dir}")
-    print(f"View your runs at https://goodseed.ai/app/local?port={port}")
+    app_base_url = APP_URL.rstrip("/")
+    print(f"View your runs at {app_base_url}/local?port={port}")
 
     try:
         server.serve_forever()

@@ -21,6 +21,7 @@ DEFAULT_PROJECT = "default"
 
 # Remote API
 API_BASE = os.environ.get("GOODSEED_API_URL", "https://api.goodseed.ai")
+APP_URL = os.environ.get("GOODSEED_APP_URL", "https://app.goodseed.ai")
 
 
 def get_home(override: str | Path | None = None) -> Path:

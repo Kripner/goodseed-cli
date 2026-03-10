@@ -39,6 +39,5 @@ keys.txt
 
 # Misc
 *.log
-.env
 .env.local
 

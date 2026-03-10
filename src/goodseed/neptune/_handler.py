@@ -42,7 +42,7 @@ class NeptuneHandler:
         self,
         value: Any,
         *,
-        step: int | float,
+        step: int | float | None = None,
         timestamp: Any = None,
         wait: bool = False,
     ) -> None:
@@ -64,7 +64,7 @@ class NeptuneHandler:
         self,
         value: Any,
         *,
-        step: int | float,
+        step: int | float | None = None,
         timestamp: Any = None,
         wait: bool = False,
     ) -> None:
@@ -79,7 +79,7 @@ class NeptuneHandler:
         self,
         values: list[Any],
         *,
-        steps: list[int | float],
+        steps: list[int | float] | None = None,
         timestamps: Any = None,
         wait: bool = False,
     ) -> None:
@@ -87,17 +87,19 @@ class NeptuneHandler:
 
         Args:
             values: List of values to append.
-            steps: List of step values (same length as values).
+            steps: List of step values (same length as values). If *None*,
+                steps are auto-assigned.
             timestamps: Ignored (API compatibility).
             wait: Ignored (API compatibility).
         """
-        if len(steps) != len(values):
+        if steps is not None and len(steps) != len(values):
             raise ValueError(
                 f"steps length ({len(steps)}) must match "
                 f"values length ({len(values)})"
             )
         for i, v in enumerate(values):
-            self._run._append_to_field(self._path, v, steps[i])
+            s = steps[i] if steps is not None else None
+            self._run._append_to_field(self._path, v, s)
 
     def fetch(self) -> Any:
         """Fetch the current value of this field from local storage."""

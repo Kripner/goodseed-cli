@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from goodseed.run import GitRef, Run
+from goodseed.run import GitRef, Run, Storage
 from goodseed.storage import LocalStorage
 
 
@@ -148,6 +148,26 @@ class TestRunInit:
         with pytest.raises(TypeError, match="unexpected keyword argument"):
             Run(goodseed_home=tmp_path, not_a_real_kwarg=True)
 
+    def test_name_allows_arbitrary_unicode_and_symbols(self, tmp_path):
+        r = Run(
+            name="exp / alpha:beta (v2) 🚀 [test] #1",
+            goodseed_home=tmp_path,
+        )
+        assert r.name == "exp / alpha:beta (v2) 🚀 [test] #1"
+        r.close()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "bad\x00name",  # NUL
+            "bad\u202Ename",  # bidi override
+            "bad\u200Bname",  # zero-width space
+        ],
+    )
+    def test_name_rejects_dangerous_chars(self, tmp_path, name):
+        with pytest.raises(ValueError, match="must not contain"):
+            Run(name=name, goodseed_home=tmp_path)
+
 
 class TestLogConfigs:
     def test_log_configs(self, run):
@@ -211,9 +231,25 @@ class TestLogMetrics:
         points = run._storage.get_metric_points("loss")
         assert points[0]["step"] == 1.5
 
-    def test_step_is_required(self, run):
-        with pytest.raises(TypeError):
-            run.log_metrics({"loss": 0.9})
+    def test_step_auto_increments_when_omitted(self, run):
+        """Auto-step via _append_to_field (used by Neptune wrappers)."""
+        run._append_to_field("loss", 0.9)
+        run._append_to_field("loss", 0.8)
+        points = run._storage.get_metric_points("loss")
+        assert len(points) == 2
+        assert points[0]["step"] == 0
+        assert points[1]["step"] == 1
+
+    def test_auto_step_advances_past_explicit_step(self, run):
+        """Auto-step via _append_to_field continues past explicit steps."""
+        run._append_to_field("loss", 0.9, step=5)
+        run._append_to_field("loss", 0.8)  # should be step=6, not 0
+        run._append_to_field("loss", 0.7)  # should be step=7
+        points = run._storage.get_metric_points("loss")
+        assert len(points) == 3
+        assert points[0]["step"] == 5
+        assert points[1]["step"] == 6
+        assert points[2]["step"] == 7
 
 
 class TestClose:
@@ -266,6 +302,42 @@ class TestClose:
         r = Run(goodseed_home=tmp_path, run_id="close-test")
         r.close()
         assert r._closed is True
+
+    def test_close_warns_when_cloud_items_remain_unuploaded(self, tmp_path, capsys):
+        class _FakeSyncProcess:
+            def __init__(self):
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        r = Run(
+            goodseed_home=tmp_path,
+            run_id="warn-test",
+            storage="local",
+        )
+        fake_sync = _FakeSyncProcess()
+        r._sync_process = fake_sync
+        r._storage_mode = Storage.CLOUD
+        r._storage.count_unuploaded = lambda: 3
+
+        r.close()
+
+        captured = capsys.readouterr()
+        assert fake_sync.closed is True
+        assert "still pending upload" in captured.err
+        assert "goodseed upload -p default -r warn-test" in captured.err
+
+    def test_cleanup_closes_unclosed_run(self, tmp_path):
+        r = Run(goodseed_home=tmp_path, run_id="cleanup-run")
+        db_path = r._db_path
+
+        r._cleanup()
+
+        assert r._closed is True
+        storage = LocalStorage(db_path)
+        assert storage.get_meta("status") == "finished"
+        storage.close()
 
 
 class TestContextManager:

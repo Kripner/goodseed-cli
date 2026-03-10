@@ -53,7 +53,7 @@ run.log_configs({"learning_rate": 0.001, "batch_size": 32})
 run.log_metrics({"loss": loss, "acc": acc}, step=step)
 ```
 
-Your data is saved to a local SQLite file. You can also use `with goodseed.Run(...) as run:` to close the run automatically.
+Your data is saved to a local SQLite file. You can also use `with goodseed.Run(...) as run:` to close the run automatically. Goodseed also registers best-effort per-run `atexit` cleanup, but calling `run.close()` (or using `with`) is still the recommended way to guarantee upload completion.
 
 ### Storage Modes
 
@@ -63,7 +63,7 @@ The `storage` parameter controls where data is stored:
 - **`"local"`** — local SQLite only, no remote sync.
 - **`"disabled"`** — no storage; all writes are silent no-ops.
 
-Cloud storage syncs data in the background while your training runs. Set the `GOODSEED_API_KEY` environment variable and use `workspace/project` format for the project name:
+Cloud storage syncs data in a background thread while your training runs. Set the `GOODSEED_API_KEY` environment variable and use `workspace/project` format for the project name:
 
 ```python
 import goodseed

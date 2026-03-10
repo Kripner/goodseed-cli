@@ -78,7 +78,7 @@ class ScaleRun:
     def log_metrics(
         self,
         data: dict[str, float],
-        step: int | float,
+        step: int | float | None = None,
         *,
         timestamp: Optional[datetime] = None,
         preview: bool = False,
@@ -104,7 +104,7 @@ class ScaleRun:
     def log_string_series(
         self,
         data: dict[str, str],
-        step: int | float,
+        step: int | float | None = None,
         *,
         timestamp: Optional[datetime] = None,
     ) -> None:

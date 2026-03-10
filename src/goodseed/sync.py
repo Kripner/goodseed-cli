@@ -1,11 +1,10 @@
-"""Background sync process for uploading run data to the remote API.
+"""Background sync thread for uploading run data to the remote API.
 
 Reads unuploaded rows from SQLite, sends them to the remote API, and marks
-them as uploaded on confirmed success. Runs as a separate OS process spawned
-via multiprocessing to avoid GIL contention with the training loop.
+them as uploaded on confirmed success. Runs in a background thread.
 
-The SQLite database (in WAL mode) serves as the durable queue and IPC
-mechanism between the main process and the sync process.
+The SQLite database (in WAL mode) serves as the durable queue between the
+producer and the sync worker.
 """
 
 from __future__ import annotations
@@ -13,16 +12,15 @@ from __future__ import annotations
 import gzip
 import json
 import logging
-import multiprocessing
-import os
 import struct
+import threading
 import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from goodseed.config import API_BASE
+from goodseed.config import API_BASE, APP_URL
 from goodseed.storage import LocalStorage
 
 logger = logging.getLogger("goodseed.sync")
@@ -33,6 +31,7 @@ _INGEST_FORMAT = "json"
 # API limits (matching the backend)
 _MAX_POINTS_PER_INGEST = 2_000_000
 _MAX_CONFIGS_PER_REQUEST = 1000
+_MAX_CONFIG_VALUE_CHARS = 10_000
 _BATCH_SIZE = 5000
 _HTTP_TIMEOUT = 30
 _SYNC_INTERVAL = 5  # seconds between sync cycles
@@ -303,7 +302,10 @@ def _ensure_run_once(
         return data.get("id"), None, False
 
     if status == 0:
-        msg = "Network error while contacting Goodseed API."
+        msg = (
+            f"Could not connect to Goodseed ({API_BASE}).\n"
+            "Check your network connection and try again."
+        )
         if log_errors:
             logger.warning("ensure_run: %s", msg)
         return None, msg, True
@@ -313,22 +315,25 @@ def _ensure_run_once(
 
     if status == 404 and error_code == "Project.NotFound":
         msg = (
-            f"Project '{project_full_name}' was not found on Goodseed. "
-            "Check --project and verify your API key has access to that workspace."
+            f"Project '{project_full_name}' not found.\n"
+            f"Create it at {APP_URL}."
         )
         if log_errors:
             logger.warning("ensure_run: %s", msg)
         return None, msg, False
 
     if status == 401:
-        msg = "Authentication failed. Check your API key."
+        msg = (
+            "Invalid API key.\n"
+            "Set GOODSEED_API_KEY or pass api_key= to Run()."
+        )
     elif status == 403:
         msg = (
-            "Permission denied for this project. "
-            "Verify your API key has the required workspace/project access."
+            f"Access denied for project '{project_full_name}'.\n"
+            f"Check that your API key has access to the '{workspace}' workspace."
         )
     else:
-        msg = parsed_message or f"HTTP {status} while ensuring run."
+        msg = parsed_message or f"HTTP {status} while registering run."
 
     if log_errors:
         logger.warning("ensure_run: HTTP %d — %s", status, msg)
@@ -366,11 +371,18 @@ def _sync_configs(
     if not configs:
         return 0
 
-    # Pre-serialise each config dict once.
+    # Pre-serialise each config dict once, truncating oversized values.
     prepared: list[tuple[dict[str, Any], bytes]] = []
     for c in configs:
+        value = c["value"]
+        if isinstance(value, str) and len(value) > _MAX_CONFIG_VALUE_CHARS:
+            value = value[:_MAX_CONFIG_VALUE_CHARS - 13] + "\n[truncated]"
+            logger.debug(
+                "Config value truncated to %d chars: %s",
+                _MAX_CONFIG_VALUE_CHARS, c["path"],
+            )
         raw = json.dumps(
-            {"path": c["path"], "type_tag": c["type_tag"], "value": c["value"]}
+            {"path": c["path"], "type_tag": c["type_tag"], "value": value}
         ).encode("utf-8")
         prepared.append((c, raw))
 
@@ -393,8 +405,11 @@ def _sync_configs(
             ])
             uploaded += len(batch)
         else:
-            body_text = resp.decode("utf-8", errors="replace") if resp else ""
-            logger.warning("config upload: HTTP %d — %s", status, body_text)
+            error_code, error_msg = _parse_api_error(resp)
+            logger.warning(
+                "Config upload failed (HTTP %d, %d items): %s",
+                status, len(batch), error_msg or "no details",
+            )
             break
     return uploaded
 
@@ -472,7 +487,10 @@ def _sync_ingest_points(
             mark_uploaded([upload_key(orig) for orig, _ in batch])
             uploaded += len(batch)
         else:
-            logger.debug("%s upload failed (status %d)", kind.capitalize(), status)
+            logger.warning(
+                "%s upload failed (HTTP %d, %d items)",
+                kind.capitalize(), status, len(batch),
+            )
             break
     return uploaded
 
@@ -518,27 +536,14 @@ def _sync_cycle(
 
 def _send_status(api_key: str, remote_id: str, status: str) -> None:
     """Send the final run status to the remote API."""
-    # Backend RunStatus enum: 0=Running, 1=Finished, 2=Failed
-    status_map = {"running": 0, "finished": 1, "failed": 2}
-    status_value = status_map.get(status, 1)
+    # Backend expects snake_case enum strings via JsonStringEnumConverter.
+    valid = {"running", "finished", "failed"}
+    status_value = status if status in valid else "finished"
     _api_post(
         f"{API_BASE}/api/v1/runs/{remote_id}/status",
         api_key=api_key,
         body={"status": status_value},
     )
-
-
-def _pid_exists(pid: int) -> bool:
-    """Check if a process with the given PID exists (signal 0, no actual signal sent)."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # process exists but different user
-    except OSError:
-        return False
 
 
 def _sync_worker(
@@ -548,14 +553,10 @@ def _sync_worker(
     project_name: str,
     run_id: str,
     experiment_name: str | None,
-    parent_pid: int,
-    shutdown_event: Any,  # multiprocessing.Event (not typed for spawn compat)
-    flush_event: Any = None,  # multiprocessing.Event (optional)
+    shutdown_event: threading.Event,
+    flush_event: threading.Event | None = None,
 ) -> None:
-    """Entry point for the background sync process.
-
-    Must be a top-level function (required by multiprocessing "spawn" context).
-    """
+    """Entry point for the background sync thread."""
     storage = LocalStorage(Path(db_path))
     remote_id: str | None = None
 
@@ -569,7 +570,7 @@ def _sync_worker(
             if remote_id is not None:
                 _sync_cycle(storage, api_key, remote_id)
 
-            should_drain = shutdown_event.is_set() or not _pid_exists(parent_pid)
+            should_drain = shutdown_event.is_set()
 
             if should_drain:
                 if remote_id is None:
@@ -599,13 +600,13 @@ def _sync_worker(
                 if flush_event is not None and flush_event.is_set():
                     flush_event.clear()
     except Exception:
-        logger.exception("Sync process error")
+        logger.exception("Sync thread error")
     finally:
         storage.close()
 
 
 class SyncProcess:
-    """Manages the background sync process lifecycle."""
+    """Manages the background sync thread lifecycle."""
 
     def __init__(
         self,
@@ -617,21 +618,24 @@ class SyncProcess:
         experiment_name: str | None = None,
     ) -> None:
         self._db_path = db_path
-        ctx = multiprocessing.get_context("spawn")
-        self._shutdown = ctx.Event()
-        self._flush = ctx.Event()
-        self._process = ctx.Process(
+        self._shutdown = threading.Event()
+        self._flush = threading.Event()
+        self._thread = threading.Thread(
             target=_sync_worker,
             args=(
                 str(db_path), api_key, workspace, project_name,
-                run_id, experiment_name, os.getpid(), self._shutdown,
-                self._flush,
+                run_id, experiment_name, self._shutdown, self._flush,
             ),
-            daemon=False,  # non-daemon: keeps running to drain on parent exit
+            name=f"goodseed-sync-{run_id}",
+            daemon=True,
         )
+        self._started = False
 
     def start(self) -> None:
-        self._process.start()
+        if self._started:
+            return
+        self._thread.start()
+        self._started = True
 
     def sync(self) -> None:
         """Request an immediate sync cycle (non-blocking)."""
@@ -646,6 +650,8 @@ class SyncProcess:
         import time
 
         self._flush.set()
+        if not self._started:
+            return
         deadline = None if timeout is None else time.monotonic() + timeout
         storage = LocalStorage(self._db_path)
         try:
@@ -655,7 +661,7 @@ class SyncProcess:
                     break
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-                if not self._process.is_alive():
+                if not self._thread.is_alive():
                     break
                 time.sleep(0.5)
         finally:
@@ -665,7 +671,8 @@ class SyncProcess:
         """Signal shutdown and block until all data is uploaded."""
         self._shutdown.set()
         self._flush.set()  # Wake the worker immediately
-        self._process.join()
+        if self._started:
+            self._thread.join()
 
 
 def upload_run(db_path: Path, api_key: str) -> int:

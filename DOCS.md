@@ -22,7 +22,7 @@ string_points(series_id INTEGER, step REAL, value TEXT, ts INTEGER,
               uploaded INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (series_id, step))
 ```
 
-The `uploaded` column tracks whether each row has been synced to the remote API. The background sync process reads rows with `uploaded=0`, uploads them, and marks them `uploaded=1` using optimistic concurrency (data values in the WHERE clause prevent marking rows overwritten since they were read).
+The `uploaded` column tracks whether each row has been synced to the remote API. The background sync thread reads rows with `uploaded=0`, uploads them, and marks them `uploaded=1` using optimistic concurrency (data values in the WHERE clause prevent marking rows overwritten since they were read).
 
 ### Server
 
@@ -261,11 +261,11 @@ When ``read_only=True``:
 
 ## Cloud Sync
 
-When ``storage="cloud"`` (the default), a separate OS process runs in the background to upload data to the remote API. The SQLite database in WAL mode serves as the durable queue and IPC mechanism.
+When ``storage="cloud"`` (the default), a background thread uploads data to the remote API. SQLite in WAL mode serves as the durable queue between training writes and uploader reads.
 
-- **Sync process**: spawned via `multiprocessing` with `"spawn"` context. Reads unuploaded rows, sends them to the API, marks them uploaded on confirmed success.
-- **Close behavior**: `run.close()` signals the sync process to drain all remaining data and blocks until upload is complete.
-- **Orphan protection**: the sync process monitors the parent PID. If the parent dies (e.g. SIGKILL), it drains remaining data and exits.
+- **Sync thread**: uses `threading.Thread` + events. It reads unuploaded rows, sends them to the API, and marks them uploaded on confirmed success.
+- **Close behavior**: `run.close()` signals the sync thread to drain remaining data and blocks until upload is complete.
+- **Shutdown behavior**: per-run cleanup is registered with `atexit`, and context-manager usage (`with Run(...)`) closes runs automatically. For hard kills (for example `SIGKILL`), Python cleanup cannot run.
 - **Manual upload**: if sync was disabled or interrupted, use `goodseed upload -p <project> [--run-id <run_id>]` to upload remaining data.
 
 Requires `GOODSEED_API_KEY` environment variable or `api_key` parameter.
@@ -346,7 +346,7 @@ goodseed/
     config.py         # Environment config and path helpers
     utils.py          # Name generation, serialization, flattening
     cli.py            # CLI entry point
-    sync.py           # Background sync process and upload_run()
+    sync.py           # Background sync thread and upload_run()
     _sync_legacy.py   # Legacy Supabase sync (not used in current workflow)
     monitoring/
       __init__.py

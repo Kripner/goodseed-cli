@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import traceback
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +23,7 @@ from enum import Enum
 
 from goodseed.config import (
     API_BASE,
+    APP_URL,
     ENV_RUN_ID,
     ENV_STORAGE,
     get_api_key,
@@ -32,7 +32,7 @@ from goodseed.config import (
 )
 from goodseed.monitoring.manager import MonitoringManager
 from goodseed.storage import LocalStorage
-from goodseed.sync import SyncProcess, _api_get, _ensure_run
+from goodseed.sync import SyncProcess, _api_get, _ensure_run, _ensure_run_once, api_get_json
 from goodseed.utils import (
     deserialize_value,
     flatten_dict,
@@ -41,7 +41,68 @@ from goodseed.utils import (
     serialize_value,
 )
 
+import re
+
 Number = Union[int, float]
+
+_MAX_RUN_ID_LEN = 128
+_MAX_EXPERIMENT_NAME_LEN = 200
+_RUN_ID_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$')
+
+
+def _has_dangerous_experiment_name_chars(value: str) -> bool:
+    """Return True if the name contains disallowed control/spoofing chars."""
+    for ch in value:
+        code = ord(ch)
+
+        # Ban control characters (including NUL and C1 control block).
+        if (0x00 <= code <= 0x1F) or (0x7F <= code <= 0x9F):
+            return True
+
+        # Ban bidi override/isolate chars to prevent visual spoofing.
+        if (0x202A <= code <= 0x202E) or (0x2066 <= code <= 0x2069):
+            return True
+
+        # Ban zero-width formatting chars that make labels ambiguous.
+        if code in {0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF}:
+            return True
+
+    return False
+
+
+def _use_color() -> bool:
+    """Check if stderr supports ANSI color codes."""
+    return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+
+
+def _goodseed_error(headline: str, detail: str = "") -> RuntimeError:
+    """Build a RuntimeError with a formatted [Goodseed] message.
+
+    Adds ANSI bold+red when stderr is a TTY.
+    """
+    if _use_color():
+        head = f"\033[1;31m[Goodseed]\033[0m \033[1m{headline}\033[0m"
+    else:
+        head = f"[Goodseed] {headline}"
+    parts = ["\n", head]
+    if detail:
+        parts.append(detail)
+    parts.append("")  # trailing newline
+    return RuntimeError("\n".join(parts))
+
+
+def _resolve_default_workspace(api_key: str) -> str:
+    """Fetch the user's default workspace from the /me endpoint."""
+    status, payload = api_get_json("/api/v1/auth/me", api_key=api_key)
+    if status == 200 and isinstance(payload, dict):
+        name = payload.get("name") or payload.get("Name")
+        if name:
+            return str(name)
+    raise _goodseed_error(
+        "Could not determine your default workspace.",
+        "Specify the full project: Run(project='workspace/project')\n"
+        "Or check that your API key is valid.",
+    )
 
 
 def _filter_paths_by_type(payload: list[dict[str, Any]], path_type: str) -> list[str]:
@@ -421,10 +482,17 @@ class Run:
         self._read_only = read_only
         self._lock = threading.RLock()
         self._closed = False
+        self._auto_step: dict[str, float] = {}  # per-path auto-increment counters
 
         if storage is None:
             storage = os.environ.get(ENV_STORAGE, Storage.CLOUD)
         self._storage_mode = Storage(storage)
+
+        if self._storage_mode == Storage.CLOUD and "/" not in self.project:
+            resolved_key = api_key or get_api_key()
+            if resolved_key:
+                workspace = _resolve_default_workspace(resolved_key)
+                self.project = f"{workspace}/{self.project}"
 
         if self._storage_mode == Storage.DISABLED:
             self._init_disabled()
@@ -489,23 +557,24 @@ class Run:
         """Set up a read-only run backed by the remote API."""
         resolved_key = api_key or get_api_key()
         if not resolved_key:
-            raise RuntimeError(
-                "read_only with storage='cloud' requires an API key. "
-                "Set GOODSEED_API_KEY or pass api_key=."
+            raise _goodseed_error(
+                "API key required.",
+                "Set GOODSEED_API_KEY or pass api_key= to Run().",
             )
         parts = self.project.split("/", 1)
         if len(parts) != 2:
-            raise RuntimeError(
-                f"project must be 'workspace/project', got: {self.project!r}"
+            raise _goodseed_error(
+                f"Invalid project format: {self.project!r}",
+                "Use 'workspace/project' format, e.g. Run(project='my-team/my-project').",
             )
         self._api_key = resolved_key
-        self._remote_id = _ensure_run(
+        remote_id, error_msg, _ = _ensure_run_once(
             resolved_key, parts[0], parts[1], run_id or "", self.name,
+            log_errors=False,
         )
-        if self._remote_id is None:
-            raise RuntimeError(
-                f"Could not resolve run on remote: {self.project}/{run_id}"
-            )
+        if remote_id is None:
+            raise _goodseed_error(error_msg)
+        self._remote_id = remote_id
         self.run_id = run_id or ""
         self._storage = None
         self._db_path = None
@@ -577,6 +646,31 @@ class Run:
         effective_id = run_id or os.environ.get(ENV_RUN_ID) or generate_run_id()
         auto_name = run_id is None and not os.environ.get(ENV_RUN_ID)
 
+        # Validate user-provided run IDs for server compatibility.
+        if not auto_name:
+            if len(effective_id) > _MAX_RUN_ID_LEN:
+                raise ValueError(
+                    f"run_id must be at most {_MAX_RUN_ID_LEN} characters, "
+                    f"got {len(effective_id)}"
+                )
+            if not _RUN_ID_RE.match(effective_id):
+                raise ValueError(
+                    f"run_id must contain only letters, digits, hyphens, "
+                    f"and underscores, and start/end with a letter or digit: "
+                    f"{effective_id!r}"
+                )
+
+        if name is not None and len(name) > _MAX_EXPERIMENT_NAME_LEN:
+            raise ValueError(
+                f"name must be at most {_MAX_EXPERIMENT_NAME_LEN} characters, "
+                f"got {len(name)}"
+            )
+        if name is not None and _has_dangerous_experiment_name_chars(name):
+            raise ValueError(
+                "name must not contain control, bidirectional override/isolate, "
+                "or zero-width formatting characters"
+            )
+
         self.run_id, db_path = _resolve_db_path(
             run_id=effective_id,
             project=self.project,
@@ -624,21 +718,25 @@ class Run:
         """Start the background sync process for cloud storage."""
         resolved_key = api_key or get_api_key()
         if not resolved_key:
-            raise RuntimeError(
-                "Cloud storage requires an API key. "
-                "Set GOODSEED_API_KEY or pass api_key=. "
-                "To disable remote sync: storage='local'"
+            raise _goodseed_error(
+                "API key required.",
+                "Set GOODSEED_API_KEY or pass api_key= to Run().\n"
+                "To skip cloud sync, use storage='local'.",
             )
         parts = self.project.split("/", 1)
         if len(parts) != 2:
-            raise RuntimeError(
-                f"project must be 'workspace/project' for cloud storage, "
-                f"got: {self.project!r}"
+            raise _goodseed_error(
+                f"Invalid project format: {self.project!r}",
+                "Use 'workspace/project' format, e.g. Run(project='my-team/my-project').",
             )
         self._api_key = resolved_key
-        self._remote_id = _ensure_run(
+        remote_id, error_msg, _ = _ensure_run_once(
             resolved_key, parts[0], parts[1], self.run_id, self.name,
+            log_errors=False,
         )
+        if remote_id is None:
+            raise _goodseed_error(error_msg)
+        self._remote_id = remote_id
         self._sync_process = SyncProcess(
             db_path=self._db_path,
             api_key=resolved_key,
@@ -733,7 +831,7 @@ class Run:
                     if isinstance(v, dict):
                         # Flatten nested dicts under their top-level key while
                         # preserving non-dict types (e.g. string_set values).
-                        flattened.update(flatten_dict({k: v}))
+                        flattened.update(flatten_dict({k: v}, cast_unsupported=True))
                     else:
                         flattened[k] = v
                 data = flattened
@@ -779,7 +877,7 @@ class Run:
             self.log_configs({key: value})
 
     def _append_to_field(
-        self, key: str, value: Any, step: Number
+        self, key: str, value: Any, step: Number | None = None
     ) -> None:
         """Append a value to a metric or string series field."""
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -891,6 +989,26 @@ class Run:
 
         return None
 
+    def _resolve_step(self, path: str, step: Number | None) -> Number:
+        """Return the step to use for *path*, advancing the auto counter.
+
+        When *step* is ``None``, returns the next auto-increment value for
+        *path* (starting at 0).  When *step* is explicit, it is returned
+        as-is but the auto counter is advanced past it so that a subsequent
+        ``None`` call won't collide.
+
+        Must be called while holding ``self._lock``.
+        """
+        if step is None:
+            s = self._auto_step.get(path, 0)
+            self._auto_step[path] = s + 1
+            return s
+        # Explicit step: advance counter past it to avoid future collisions.
+        prev = self._auto_step.get(path, 0)
+        if step + 1 > prev:
+            self._auto_step[path] = step + 1
+        return step
+
     def log_metrics(
         self,
         data: dict[str, float],
@@ -916,7 +1034,8 @@ class Run:
             points = []
             for k, v in data.items():
                 path = normalize_path(k)
-                points.append((path, step, float(v), ts))
+                s = self._resolve_step(path, step)
+                points.append((path, s, float(v), ts))
 
             self._storage.log_metric_points(points)
 
@@ -945,7 +1064,8 @@ class Run:
             points = []
             for k, v in data.items():
                 path = normalize_path(k)
-                points.append((path, step, str(v), ts))
+                s = self._resolve_step(path, step)
+                points.append((path, s, str(v), ts))
 
             self._storage.log_string_points(points)
 
@@ -1097,9 +1217,27 @@ class Run:
             serialized[k] = (type_tag, val)
         self._storage.log_configs(serialized)
 
+        remaining_unuploaded: int | None = None
         if self._sync_process is not None:
             self._sync_process.close()
+            try:
+                remaining_unuploaded = self._storage.count_unuploaded()
+            except Exception:
+                remaining_unuploaded = None
             self._sync_process = None
+
+        if (
+            self._storage_mode == Storage.CLOUD
+            and remaining_unuploaded is not None
+            and remaining_unuploaded > 0
+        ):
+            print(
+                "[Goodseed] Warning: "
+                f"{remaining_unuploaded} item(s) are still pending upload. "
+                "You can upload remaining data with:\n"
+                f"  goodseed upload -p {self.project} -r {self.run_id}",
+                file=sys.stderr,
+            )
 
         self._storage.checkpoint_wal()
         self._storage.close()

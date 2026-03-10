@@ -47,7 +47,7 @@ def load_data():
 
 
 def train_one(hidden_size, lr, dropout, num_epochs):
-    run = goodseed.Run(experiment_name="synth-mlp", project="examples")
+    run = goodseed.Run(name="synth-mlp", project="examples")
 
     run.log_configs({
         "model/hidden_size": hidden_size,
