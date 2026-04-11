@@ -94,6 +94,12 @@ def _goodseed_error(headline: str, detail: str = "") -> RuntimeError:
 def _resolve_default_workspace(api_key: str) -> str:
     """Fetch the user's default workspace from the /me endpoint."""
     status, payload = api_get_json("/api/v1/auth/me", api_key=api_key)
+    if status == 0:
+        raise _goodseed_error(
+            "Could not reach the Goodseed backend.",
+            "Check your internet connection and try again.\n"
+            "If you are behind a proxy, make sure HTTPS_PROXY is set.",
+        )
     if status == 200 and isinstance(payload, dict):
         name = payload.get("name") or payload.get("Name")
         if name:
@@ -314,7 +320,7 @@ def _collect_git_configs(git_ref: bool | GitRef | _DisabledGitRefType | None) ->
 
 
 class _FieldHandler:
-    """Handler for Neptune-style field access: ``run["key"].log(value)``.
+    """Handler for bracket-style field access: ``run["key"].log(value)``.
 
     Returned by ``Run.__getitem__``. Supports ``.log()`` for logging
     metric or string series values, plus ``.add()`` / ``.remove()`` for
@@ -1172,7 +1178,11 @@ class Run:
         )
         if status != 200:
             raise RuntimeError(f"Failed to fetch string data (status {status})")
-        return json.loads(resp)
+        data = json.loads(resp)
+        # Backend returns {points, total}; unwrap for backwards compatibility
+        if isinstance(data, dict) and "points" in data:
+            return data["points"]
+        return data
 
     def get_configs(self) -> list[dict[str, Any]]:
         """Fetch configs from the remote API.

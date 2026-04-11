@@ -37,6 +37,7 @@ _HTTP_TIMEOUT = 30
 _SYNC_INTERVAL = 5  # seconds between sync cycles
 _MAX_DRAIN_ITERATIONS = 100  # safety limit for drain loop
 _MAX_BODY_BYTES = 16 * 1024 * 1024  # 16 MiB per request
+_HEARTBEAT_INTERVAL = 15  # seconds between heartbeat calls
 
 
 def _api_post(
@@ -546,6 +547,11 @@ def _send_status(api_key: str, remote_id: str, status: str) -> None:
     )
 
 
+def _send_heartbeat(api_key: str, remote_id: str) -> None:
+    """Send a lightweight heartbeat to keep the run marked as alive."""
+    _api_post(f"{API_BASE}/api/v1/runs/{remote_id}/heartbeat", api_key=api_key)
+
+
 def _sync_worker(
     db_path: str,
     api_key: str,
@@ -557,8 +563,11 @@ def _sync_worker(
     flush_event: threading.Event | None = None,
 ) -> None:
     """Entry point for the background sync thread."""
+    import time as _time
+
     storage = LocalStorage(Path(db_path))
     remote_id: str | None = None
+    last_heartbeat: float = 0.0
 
     try:
         while True:
@@ -569,6 +578,10 @@ def _sync_worker(
 
             if remote_id is not None:
                 _sync_cycle(storage, api_key, remote_id)
+                now = _time.monotonic()
+                if now - last_heartbeat >= _HEARTBEAT_INTERVAL:
+                    _send_heartbeat(api_key, remote_id)
+                    last_heartbeat = now
 
             should_drain = shutdown_event.is_set()
 

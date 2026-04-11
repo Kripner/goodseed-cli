@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "goodseed"
-version = "0.3.2"
+version = "0.4.0"
 description = "ML experiment tracker"
 readme = "README.md"
 license = "MIT"
@@ -13,6 +13,7 @@ requires-python = ">=3.9"
 authors = [
     { name = "Matěj Kripner" },
     { name = "Vojtěch Hotmar" },
+    { name = "Tomáš Sláma" },
 ]
 keywords = ["machine-learning", "experiment-tracking", "mlops"]
 classifiers = [

@@ -166,9 +166,16 @@ class HardwareMonitorDaemon(MonitoringDaemon):
         except Exception:
             pass
 
-        # Memory %
+        # Memory (process tree RSS in GB)
         try:
-            metrics["memory"] = psutil.virtual_memory().percent
+            proc = psutil.Process()
+            rss = proc.memory_info().rss
+            for child in proc.children(recursive=True):
+                try:
+                    rss += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            metrics["memory"] = round(rss / (1024 ** 3), 2)
         except Exception:
             pass
 

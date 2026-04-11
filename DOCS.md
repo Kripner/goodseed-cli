@@ -48,7 +48,7 @@ CORS is enabled (`Access-Control-Allow-Origin: *`) so the frontend at goodseed.a
 
 ### Monitoring
 
-Goodseed automatically captures system metrics and console output in a background thread, following Neptune's monitoring namespace convention.
+Goodseed automatically captures system metrics and console output in a background thread.
 
 **Namespace**: `monitoring/<8-char-hash>/` where the hash is derived from `hostname:pid:tid`. This ensures each process gets its own namespace.
 
@@ -360,7 +360,6 @@ goodseed/
     test_utils.py
     test_integration.py     # full workflow + HTTP server + monitoring tests
     test_cli.py
-    test_neptune_proxy.py
   examples/
     mlp.py                  # PyTorch MLP on synthetic data (requires torch, sklearn)
 ```

@@ -2,7 +2,7 @@
 
 ML experiment tracker. Logs metrics and configs to local SQLite files, serves them via a built-in HTTP server, and visualizes them in the browser.
 
-Full documentation at [goodseed.ai/docs](https://goodseed.ai/docs/).
+Full documentation at [docs.goodseed.ai](https://docs.goodseed.ai).
 
 ## Install
 
@@ -14,7 +14,7 @@ Python 3.9+ required.
 
 For development:
 ```bash
-pip install -e ".[dev]"
+uv sync --extra dev
 ```
 
 ## Quick Start
@@ -126,10 +126,6 @@ goodseed serve
 
 Open the printed link in your browser to see your runs, metrics, and configs.
 
-## Coming from Neptune?
-
-You can export your data from [neptune.ai](https://neptune.ai) and import it into GoodSeed using [neptune-exporter](https://github.com/neptune-ai/neptune-exporter). See the [migration guide](https://docs.neptune.ai/transition_hub/migration/to_goodseed) for details.
-
 ## Configuration
 
 | Variable | Description |
@@ -183,19 +179,9 @@ goodseed upload -p <workspace/project>                    # Upload all runs
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -v
+uv sync --extra dev
+uv run pytest tests/ -v
 ```
-
-Run the upstream Neptune exporter compatibility E2E test (disabled by default):
-
-```bash
-GOODSEED_RUN_NEPTUNE_EXPORTER_E2E=1 pytest tests/test_neptune_exporter_e2e.py -v
-```
-
-Optional:
-- set `NEPTUNE_EXPORTER_DIR` to use an existing local clone
-- by default, the test uses `archive/neptune-exporter` from this workspace
 
 See [DOCS.md](DOCS.md) for architecture details and API reference.
 
